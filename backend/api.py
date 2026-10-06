@@ -1,3 +1,4 @@
+import math
 import os
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -7,7 +8,19 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 from claimer import start as start_claimer
-from models import Base, ConvergenceLog, SessionLocal, engine, row_dict
+from models import (
+    Base,
+    ConvergenceLog,
+    GateEvent,
+    GateRejection,
+    RainGateState,
+    SessionLocal,
+    engine,
+    gate_event_dict,
+    gate_rejection_dict,
+    gate_state_dict,
+    row_dict,
+)
 
 SECRET = os.environ.get("JWT_SECRET", "tunnelconv-dev-secret")
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -43,6 +56,8 @@ def seed():
                     processed_at=now,
                 )
             )
+        if db.get(RainGateState, 1) is None:
+            db.add(RainGateState(id=1, is_open=False))
         db.commit()
     finally:
         db.close()
@@ -85,7 +100,7 @@ def require_writer(fn):
         if user is None:
             return jsonify({"detail": "未登录"}), 401
         if user["role"] != "writer":
-            return jsonify({"detail": "仅测量员可提交收敛读数"}), 403
+            return jsonify({"detail": "仅测量员可执行此操作"}), 403
         g.user = user
         return fn(*args, **kwargs)
 
@@ -134,8 +149,31 @@ def create_log():
         delta_mm = float(body.get("delta_mm"))
     except (TypeError, ValueError):
         return jsonify({"detail": "收敛值必须是数字"}), 400
+    if not math.isfinite(delta_mm):
+        return jsonify({"detail": "收敛值必须是数字"}), 400
     db = SessionLocal()
     try:
+        # 行锁取闸状态：闸开且越界 -> 整份退回，并与真实拒收同事务写退回流水
+        gate = db.get(RainGateState, 1, with_for_update=True)
+        if gate is not None and gate.is_open:
+            limit = float(gate.rain_limit_mm)
+            if abs(delta_mm) > limit:
+                reason = f"雨量闸开启（上限 {limit} mm），读数 {delta_mm} mm 越界，报送整份退回"
+                rejection = GateRejection(
+                    chainage=chainage,
+                    delta_mm=delta_mm,
+                    rain_limit_mm=limit,
+                    reason=reason,
+                    rejected_by=g.user["username"],
+                    created_at=datetime.now(timezone.utc),
+                )
+                db.add(rejection)
+                db.commit()
+                db.refresh(rejection)
+                return (
+                    jsonify({"detail": reason, "rejection": gate_rejection_dict(rejection)}),
+                    422,
+                )
         row = ConvergenceLog(
             chainage=chainage,
             delta_mm=delta_mm,
@@ -147,5 +185,138 @@ def create_log():
         db.commit()
         db.refresh(row)
         return jsonify(row_dict(row)), 201
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.get("/api/rain-gate")
+@require_login
+def get_rain_gate():
+    db = SessionLocal()
+    try:
+        gate = db.get(RainGateState, 1)
+        last_close = (
+            db.query(GateEvent)
+            .filter(GateEvent.action == "close")
+            .order_by(GateEvent.id.desc())
+            .first()
+        )
+        payload = gate_state_dict(gate)
+        payload["last_open_duration_seconds"] = (
+            last_close.duration_seconds if last_close else None
+        )
+        return jsonify(payload)
+    finally:
+        db.close()
+
+
+@app.post("/api/rain-gate/open")
+@require_writer
+def open_rain_gate():
+    body = request.get_json(silent=True) or {}
+    raw = body.get("rain_limit_mm")
+    # 阈值留空不许开闸；阈值必须由测量员在专页写入后端，前端不得自编
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return jsonify({"detail": "雨量阈值不能为空，留空不许开闸"}), 400
+    try:
+        limit = float(raw)
+    except (TypeError, ValueError):
+        return jsonify({"detail": "雨量阈值必须是数字"}), 400
+    if not math.isfinite(limit) or limit <= 0:
+        return jsonify({"detail": "雨量阈值必须是大于 0 的数字"}), 400
+
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        gate = db.get(RainGateState, 1, with_for_update=True)
+        if gate is None:
+            gate = RainGateState(id=1)
+            db.add(gate)
+            db.flush()
+        if gate.is_open:
+            return jsonify({"detail": "雨量闸已处于开启状态"}), 409
+        gate.is_open = True
+        gate.rain_limit_mm = limit
+        gate.opened_by = g.user["username"]
+        gate.opened_at = now
+        gate.updated_at = now
+        event = GateEvent(
+            action="open",
+            rain_limit_mm=limit,
+            operator=g.user["username"],
+            created_at=now,
+        )
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+        return jsonify(gate_event_dict(event)), 201
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.post("/api/rain-gate/close")
+@require_writer
+def close_rain_gate():
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        gate = db.get(RainGateState, 1, with_for_update=True)
+        if gate is None or not gate.is_open:
+            return jsonify({"detail": "雨量闸未开启"}), 409
+        duration = None
+        if gate.opened_at is not None:
+            opened_at = gate.opened_at
+            if opened_at.tzinfo is None:  # SQLite 读回为 naive，按 UTC 处理
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            duration = (now - opened_at).total_seconds()
+        event = GateEvent(
+            action="close",
+            rain_limit_mm=gate.rain_limit_mm,
+            operator=g.user["username"],
+            created_at=now,
+            duration_seconds=duration,
+        )
+        db.add(event)
+        gate.is_open = False
+        gate.rain_limit_mm = None
+        gate.opened_by = None
+        gate.opened_at = None
+        gate.updated_at = now
+        db.commit()
+        db.refresh(event)
+        return jsonify(gate_event_dict(event)), 200
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@app.get("/api/rain-gate/journal")
+@require_login
+def rain_gate_journal():
+    """流水：开/关闸记录与越界退回记录按时间合并，新的在前。"""
+    db = SessionLocal()
+    try:
+        events = db.query(GateEvent).order_by(GateEvent.id.desc()).all()
+        rejections = db.query(GateRejection).order_by(GateRejection.id.desc()).all()
+        items = []
+        for e in events:
+            d = gate_event_dict(e)
+            d["kind"] = "gate"
+            items.append(d)
+        for r in rejections:
+            d = gate_rejection_dict(r)
+            d["kind"] = "rejection"
+            d["operator"] = d.pop("rejected_by")
+            items.append(d)
+        items.sort(key=lambda x: x["created_at"] or "", reverse=True)
+        return jsonify(items)
     finally:
         db.close()
