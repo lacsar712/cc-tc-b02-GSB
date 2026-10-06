@@ -38,3 +38,21 @@ docker compose up --build
 |------|------|------|
 | K12+180 | 1.2 mm | 合格 |
 | K18+040 | 5.6 mm | 超限 |
+
+## 雨量闸（洞口雨量站停报）
+
+页眉「雨量闸」进入专页，分四块：**阈值、上次开闸持续时长、流水、说明**。
+
+- 测量员（surveyor）写下雨量上限后**开闸**：阈值留空不许开闸（后台 400 强制，非前端做样子）。
+- 开闸期间每份报送必须随附**洞口雨量**；后台采到雨量超过上限，整份报送**真实退回**（HTTP 403，不入库、不进待判），并在**同一事务**写入一条「越界拒收」流水。
+- **关闸**后新单不再拦截；关闸结算上次开闸持续时长。
+- 巡检员（inspector）可看阈值与开闸/拒收流水，不能扳开关（写接口 403）。
+
+接口：`GET /api/gate`、`POST /api/gate/open`（body `threshold_mm`）、`POST /api/gate/close`。
+交单 `POST /api/logs` 开闸期间需带 `rainfall_mm`。
+
+无 Docker/Postgres 时可用 SQLite 跑端到端验收：
+
+```bash
+DATABASE_URL=sqlite:////tmp/t.db python backend/e2e_gate.py
+```
